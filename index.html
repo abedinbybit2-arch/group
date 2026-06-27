@@ -56,6 +56,68 @@
     return unsub;
   };
 </script>
+<!-- Telegram MTProto bridge (real personal account login — NOT the bot token).
+     Loaded lazily from a CDN ONLY when the user actually opens "Telegram Login"
+     and tries to connect, so the rest of the dashboard keeps working even
+     offline / if this third-party library or its CDN is unreachable. -->
+<script type="module">
+  let _mtClient = null;
+  let _getSRPParams = null;
+
+  async function ensureClient(apiId, apiHash) {
+    if (_mtClient) return _mtClient;
+    // @mtproto/core: open-source (non-official) MTProto implementation that
+    // talks to Telegram's data-centers directly over WebSocket from the
+    // browser — same approach Telegram Web itself uses, no backend needed.
+    const mod = await import('https://esm.sh/@mtproto/core@6.3.0/envs/browser');
+    const MTProto = mod.default;
+    _getSRPParams = mod.getSRPParams;
+    _mtClient = new MTProto({ api_id: Number(apiId), api_hash: apiHash });
+    return _mtClient;
+  }
+
+  window.tgmConnect = async function(apiId, apiHash) {
+    await ensureClient(apiId, apiHash);
+    return true;
+  };
+
+  // Generic call wrapper: auto-retries on DC migration (303) and on short
+  // FLOOD_WAIT_x (420, ≤30s) once — anything longer is surfaced to the caller
+  // so the UI can decide (long floods usually mean "stop and wait").
+  window.tgmCall = async function(method, params = {}, options = {}, _retried = false) {
+    if (!_mtClient) throw new Error('আগে Connect করুন — MTProto client শুরু হয়নি');
+    try {
+      return await _mtClient.call(method, params, options);
+    } catch (error) {
+      const code = error?.error_code;
+      const msg = error?.error_message || '';
+      if (code === 303) {
+        const dcId = Number(msg.split('_MIGRATE_')[1]);
+        if (dcId) {
+          _mtClient.setDefaultDc(dcId);
+          return window.tgmCall(method, params, options, _retried);
+        }
+      }
+      if (code === 420 && !_retried) {
+        const seconds = Number(msg.split('FLOOD_WAIT_')[1]) || 0;
+        if (seconds > 0 && seconds <= 30) {
+          await new Promise(r => setTimeout(r, (seconds + 1) * 1000));
+          return window.tgmCall(method, params, options, true);
+        }
+      }
+      throw error;
+    }
+  };
+
+  window.tgmGetSRPParams = async function(args) {
+    if (!_getSRPParams) throw new Error('Library এখনো লোড হয়নি');
+    return _getSRPParams(args);
+  };
+
+  window.tgmReset = function() {
+    _mtClient = null;
+  };
+</script>
 <style>
   :root {
     --bg: #0d1117;
@@ -517,148 +579,46 @@
     50%{opacity:.4;transform:scale(.7)}
   }
 
-  /* ── CHAT PAGE ── */
-  .chat-layout {
-    display: grid;
-    grid-template-columns: 260px 1fr;
-    height: calc(100vh - 56px - 80px);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    overflow: hidden;
-    background: var(--surface);
+  /* ── TELEGRAM ACCOUNT LOGIN (MTProto, real user account) ── */
+  .badge-skip { background: #20242b; color: var(--muted); }
+
+  .tgacc-account-bar {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; flex-wrap: wrap;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 14px 18px; margin-bottom: 20px;
   }
-  .chat-group-list {
-    border-right: 1px solid var(--border);
-    overflow-y: auto;
-    display: flex; flex-direction: column;
+  .tgacc-account-info { display: flex; align-items: center; gap: 12px; }
+  .tgacc-avatar {
+    width: 42px; height: 42px; border-radius: 50%;
+    background: linear-gradient(135deg, #2ea6ff, #0066cc);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 17px; font-weight: 700; color: #fff; flex-shrink: 0;
+    text-transform: uppercase;
   }
-  .chat-group-item {
+  .tgacc-name { font-size: 14px; font-weight: 700; }
+  .tgacc-phone { font-size: 12px; color: var(--muted); font-family: monospace; }
+
+  .tgacc-dialog-list { display: flex; flex-direction: column; gap: 8px; max-height: 460px; overflow-y: auto; }
+  .tgacc-dialog-item {
     display: flex; align-items: center; gap: 10px;
-    padding: 12px 14px; cursor: pointer;
-    border-bottom: 1px solid var(--border);
-    transition: background .15s; position: relative;
+    padding: 10px 12px; border-radius: var(--radius);
+    border: 1px solid var(--border); background: var(--bg);
+    cursor: pointer;
   }
-  .chat-group-item:hover { background: var(--surface2); }
-  .chat-group-item.active { background: #0d1e33; border-left: 3px solid var(--accent); }
-  .chat-group-item .cg-avatar {
-    width: 40px; height: 40px; border-radius: 50%;
-    background: linear-gradient(135deg, #1a3a5c, #0066cc);
-    display: flex; align-items: center; justify-content: center;
-    font-size: 15px; font-weight: 700; color: #fff; flex-shrink: 0;
-  }
-  .chat-group-item .cg-info { flex: 1; min-width: 0; }
-  .chat-group-item .cg-name { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .chat-group-item .cg-last { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
-  .chat-group-item .cg-badge {
-    background: var(--accent); color: #fff;
-    border-radius: 50%; width: 18px; height: 18px;
-    font-size: 10px; font-weight: 700;
-    display: flex; align-items: center; justify-content: center;
-    flex-shrink: 0;
-  }
+  .tgacc-dialog-item .group-avatar { width: 34px; height: 34px; font-size: 14px; }
+  .tgacc-dialog-info { flex: 1; min-width: 0; }
+  .tgacc-dialog-name { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tgacc-dialog-meta { font-size: 11px; color: var(--muted); }
+  .tgacc-dialog-status { font-size: 11px; flex-shrink: 0; white-space: nowrap; }
 
-  .chat-main {
-    display: flex; flex-direction: column;
-    overflow: hidden;
+  .tgacc-summary-bar {
+    display: flex; gap: 20px; flex-wrap: wrap; align-items: center;
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 12px 16px; margin: 14px 0;
+    font-size: 13px; font-weight: 600;
   }
-  .chat-header {
-    padding: 12px 16px;
-    border-bottom: 1px solid var(--border);
-    display: flex; align-items: center; gap: 12px;
-    background: var(--surface);
-    flex-shrink: 0;
-  }
-  .chat-header-name { font-size: 14px; font-weight: 700; }
-  .chat-header-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
-  .chat-header-live { font-size: 11px; color: var(--green); font-weight: 600; display: flex; align-items: center; gap: 4px; }
-
-  .chat-messages {
-    flex: 1; overflow-y: auto;
-    padding: 16px; display: flex; flex-direction: column; gap: 10px;
-  }
-  .chat-empty {
-    flex: 1; display: flex; align-items: center; justify-content: center;
-    flex-direction: column; gap: 10px; color: var(--muted);
-  }
-
-  .msg-bubble {
-    max-width: 72%; word-wrap: break-word;
-  }
-  .msg-bubble.incoming { align-self: flex-start; }
-  .msg-bubble.outgoing { align-self: flex-end; }
-
-  .msg-bubble .msg-sender {
-    font-size: 11px; font-weight: 700; color: var(--accent); margin-bottom: 3px;
-  }
-  .msg-bubble .msg-body {
-    padding: 9px 13px; border-radius: 12px;
-    font-size: 13px; line-height: 1.5;
-    white-space: pre-wrap; word-break: break-word;
-  }
-  .msg-bubble.incoming .msg-body {
-    background: var(--surface2); border: 1px solid var(--border);
-    border-bottom-left-radius: 3px;
-  }
-  .msg-bubble.outgoing .msg-body {
-    background: #0d2d4a; border: 1px solid #1a4070;
-    border-bottom-right-radius: 3px; color: #cde;
-  }
-  .msg-bubble .msg-time {
-    font-size: 10px; color: var(--muted); margin-top: 3px;
-    text-align: right;
-  }
-  .msg-bubble.incoming .msg-time { text-align: left; }
-  .msg-bubble .msg-reply-orig {
-    font-size: 11px; color: var(--muted);
-    border-left: 3px solid var(--accent);
-    padding: 4px 8px; margin-bottom: 5px;
-    background: rgba(46,166,255,.07); border-radius: 4px;
-    overflow: hidden; max-height: 44px;
-  }
-  .msg-bubble.reply-highlight .msg-body { border-color: var(--accent); }
-
-  .chat-input-bar {
-    padding: 12px 16px;
-    border-top: 1px solid var(--border);
-    display: flex; flex-direction: column; gap: 8px;
-    background: var(--surface); flex-shrink: 0;
-  }
-  .chat-reply-preview {
-    display: none; background: #0d1e33;
-    border-left: 3px solid var(--accent);
-    border-radius: 6px; padding: 6px 10px;
-    font-size: 12px; color: var(--muted);
-    display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  }
-  .chat-reply-preview.active { display: flex; }
-  .chat-input-row { display: flex; gap: 8px; align-items: flex-end; }
-  .chat-input-row textarea {
-    flex: 1; min-height: 38px; max-height: 120px;
-    resize: none; padding: 9px 12px; font-size: 13px;
-    border-radius: 20px; line-height: 1.4;
-  }
-  .chat-send-btn {
-    width: 40px; height: 40px; border-radius: 50%;
-    background: var(--accent); border: none; cursor: pointer;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 16px; flex-shrink: 0; transition: background .15s;
-    color: #fff;
-  }
-  .chat-send-btn:hover { background: #1a8fe3; }
-  .chat-send-btn:disabled { opacity: .4; cursor: not-allowed; }
-
-  .chat-no-group {
-    flex: 1; display: flex; align-items: center; justify-content: center;
-    flex-direction: column; gap: 12px; color: var(--muted);
-    font-size: 14px;
-  }
-
-  @media (max-width: 700px) {
-    .chat-layout { grid-template-columns: 1fr; }
-    .chat-group-list { display: none; }
-    .chat-layout.mobile-list .chat-group-list { display: flex; }
-    .chat-layout.mobile-list .chat-main { display: none; }
-  }
+  .tgacc-summary-bar .n { font-size: 16px; margin-right: 5px; }
 
   /* scrollbar */
   ::-webkit-scrollbar { width: 6px; }
@@ -814,7 +774,7 @@
       <div class="nav-tabs">
         <button class="nav-tab active" onclick="showPage('page-send', this)">📤 Message পাঠান</button>
         <button class="nav-tab" onclick="showPage('page-groups', this)">📋 Groups Info</button>
-        <button class="nav-tab" onclick="showPage('page-chat', this); initChatPage()">💬 Chat</button>
+        <button class="nav-tab" onclick="showPage('page-tgacc', this); renderTgAccUI()">📱 Telegram Login</button>
         <button class="nav-tab" onclick="showPage('page-ai', this)">🤖 AI Auto-Reply</button>
         <button class="nav-tab" onclick="showPage('page-log', this)">📜 Activity Log</button>
       </div>
@@ -902,60 +862,110 @@
         <div id="groups-detail-list" style="display:flex;flex-direction:column;gap:12px"></div>
       </div>
 
-      <!-- PAGE: CHAT -->
-      <div id="page-chat" class="page">
-        <div class="page-header" style="margin-bottom:14px">
-          <h2>💬 Group Chat</h2>
-          <p>Group-এ আসা message দেখুন ও reply করুন — Live polling চালু থাকবে</p>
+      <!-- PAGE: TELEGRAM ACCOUNT LOGIN -->
+      <div id="page-tgacc" class="page">
+        <div class="page-header">
+          <h2>📱 Telegram Account Login</h2>
+          <p>আপনার নিজের Telegram account দিয়ে লগইন করুন — account-এর সব group দেখুন এবং এক ক্লিকে সবগুলোতে bot add করুন</p>
         </div>
-        <div class="chat-layout" id="chat-layout">
-          <!-- Group list panel -->
-          <div class="chat-group-list" id="chat-group-list">
-            <div style="padding:12px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
-              <span style="font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.7px">Groups</span>
-              <div style="display:flex;align-items:center;gap:6px">
-                <span id="chat-poll-badge" style="font-size:11px;color:var(--muted)">Polling বন্ধ</span>
-                <button id="chat-poll-btn" class="btn btn-green" style="font-size:11px;padding:4px 10px" onclick="toggleChatPolling()">▶ চালু</button>
-              </div>
+
+        <div class="alert alert-warn">
+          <span>⚠️</span>
+          <span>
+            এটি Telegram-এর MTProto API দিয়ে <b>সরাসরি browser থেকে</b> আপনার আসল Telegram account-এ লগইন করে (bot token নয় — real personal account)। Login session এই browser-এর <b>localStorage</b>-এই থাকে, Firebase-এ পাঠানো হয় না।<br><br>
+            অনেক group-এ খুব দ্রুত bot add করলে Telegram সেটাকে spam/abuse মনে করে account সাময়িকভাবে সীমিত করে দিতে পারে — তাই প্রতি group-এর মাঝে delay দেওয়া আছে এবং একসাথে অনেক (৫০+) group না করে ধীরে ধীরে করার পরামর্শ দেওয়া হচ্ছে।
+          </span>
+        </div>
+
+        <!-- LOGIN FORM -->
+        <div class="compose-panel" id="tgacc-login-panel">
+          <h3>🔑 Account লগইন</h3>
+
+          <div id="tgacc-step-creds">
+            <div class="alert alert-info" style="margin-bottom:14px">
+              <span>ℹ️</span>
+              <span style="font-size:12px">api_id ও api_hash পাবেন <a href="https://my.telegram.org" target="_blank" style="color:var(--accent)">my.telegram.org</a> থেকে — নিজের Telegram account দিয়ে লগইন করে "API development tools"-এ একটি app তৈরি করুন।</span>
             </div>
-            <div id="chat-group-items"></div>
+            <div class="field-group">
+              <label>API ID</label>
+              <input type="text" id="tgacc-api-id" placeholder="যেমন: 1234567">
+            </div>
+            <div class="field-group">
+              <label>API Hash</label>
+              <input type="text" id="tgacc-api-hash" placeholder="32 অক্ষরের hash">
+            </div>
+            <div class="field-group">
+              <label>Phone Number (country code সহ)</label>
+              <input type="text" id="tgacc-phone" placeholder="+8801XXXXXXXXX">
+            </div>
+            <button class="btn btn-primary btn-full" id="tgacc-send-code-btn" onclick="tgAccSendCode()">📨 কোড পাঠান</button>
           </div>
-          <!-- Main chat panel -->
-          <div class="chat-main" id="chat-main">
-            <div class="chat-no-group" id="chat-no-group">
-              <div style="font-size:48px">💬</div>
-              <div>বাম দিক থেকে একটি Group বেছে নিন</div>
-              <div style="font-size:12px;color:var(--muted)">তারপর ▶ চালু বাটনে চাপুন — নতুন message আসলে এখানে দেখাবে</div>
+
+          <div id="tgacc-step-code" style="display:none">
+            <p style="font-size:13px;color:var(--muted);margin-bottom:14px">Telegram app-এ (বা SMS-এ) পাওয়া কোডটি লিখুন।</p>
+            <div class="field-group">
+              <label>Login Code</label>
+              <input type="text" id="tgacc-code" placeholder="12345" onkeydown="if(event.key==='Enter')tgAccVerifyCode()">
             </div>
-            <div id="chat-active-panel" style="display:none;flex-direction:column;height:100%">
-              <!-- header -->
-              <div class="chat-header">
-                <div class="cg-avatar" id="chat-active-avatar" style="width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#1a3a5c,#0066cc);display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;color:#fff;flex-shrink:0"></div>
-                <div style="flex:1">
-                  <div class="chat-header-name" id="chat-active-name">—</div>
-                  <div class="chat-header-meta" id="chat-active-meta">—</div>
-                </div>
-                <div class="chat-header-live" id="chat-live-indicator" style="display:none">
-                  <span style="width:7px;height:7px;border-radius:50%;background:var(--green);display:inline-block;animation:pulse-anim 1s ease infinite"></span> Live
-                </div>
+            <div style="display:flex;gap:8px">
+              <button class="btn btn-ghost" onclick="tgAccBackToCreds()">← পেছনে</button>
+              <button class="btn btn-primary btn-full" onclick="tgAccVerifyCode()">✓ যাচাই করুন</button>
+            </div>
+          </div>
+
+          <div id="tgacc-step-password" style="display:none">
+            <p style="font-size:13px;color:var(--muted);margin-bottom:14px">এই account-এ Two-Step Verification (2FA) চালু আছে — Password দিন।</p>
+            <div class="field-group">
+              <label>Password</label>
+              <input type="password" id="tgacc-password" placeholder="2FA Password" onkeydown="if(event.key==='Enter')tgAccCheckPassword()">
+            </div>
+            <button class="btn btn-primary btn-full" onclick="tgAccCheckPassword()">🔓 লগইন করুন</button>
+          </div>
+
+          <div id="tgacc-status" style="margin-top:12px;font-size:13px;min-height:18px"></div>
+        </div>
+
+        <!-- LOGGED-IN VIEW -->
+        <div id="tgacc-main-panel" style="display:none">
+          <div class="tgacc-account-bar">
+            <div class="tgacc-account-info">
+              <div class="tgacc-avatar" id="tgacc-avatar">?</div>
+              <div>
+                <div class="tgacc-name" id="tgacc-name">—</div>
+                <div class="tgacc-phone" id="tgacc-phone-show">—</div>
               </div>
-              <!-- messages -->
-              <div class="chat-messages" id="chat-messages-area"></div>
-              <!-- reply preview -->
-              <div class="chat-reply-preview" id="chat-reply-preview">
-                <div style="flex:1;overflow:hidden">
-                  <span style="font-size:10px;color:var(--accent);font-weight:700">Reply করছেন:</span>
-                  <div id="chat-reply-text" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
-                </div>
-                <button onclick="clearReply()" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:16px;line-height:1">✕</button>
-              </div>
-              <!-- input -->
-              <div class="chat-input-bar">
-                <div class="chat-input-row">
-                  <textarea id="chat-input-text" class="chat-input-field" placeholder="Message লিখুন... (Enter পাঠাবে, Shift+Enter নতুন লাইন)" onkeydown="chatInputKeydown(event)"></textarea>
-                  <button class="chat-send-btn" id="chat-send-btn" onclick="sendChatReply()" disabled>✈</button>
-                </div>
-              </div>
+            </div>
+            <div style="display:flex;gap:8px">
+              <button class="btn btn-ghost" onclick="tgAccLoadDialogs()">⟳ Group তালিকা রিফ্রেশ</button>
+              <button class="btn btn-danger" onclick="tgAccLogout()">🚪 লগআউট</button>
+            </div>
+          </div>
+
+          <div class="compose-panel">
+            <h3>🤖 কোন Bot Add করা হবে</h3>
+            <div class="field-group">
+              <label>Bot বাছাই করুন</label>
+              <select id="tgacc-bot-select" onchange="renderTgAccDialogList()"></select>
+            </div>
+
+            <div style="display:flex;align-items:center;justify-content:space-between;margin:14px 0 8px">
+              <span style="font-size:13px;font-weight:700">📋 এই Account-এর Groups (<span id="tgacc-dialog-count">0</span>)</span>
+              <button class="btn btn-ghost" style="font-size:11px;padding:4px 10px" onclick="tgAccToggleSelectAll()">সব সিলেক্ট/আনসিলেক্ট</button>
+            </div>
+            <div id="tgacc-dialog-list" class="tgacc-dialog-list">
+              <div class="empty-state" style="padding:30px 10px"><p>লগইন করার পর এখানে group তালিকা দেখা যাবে।</p></div>
+            </div>
+
+            <div class="tgacc-summary-bar" id="tgacc-summary-bar" style="display:none">
+              <div><span class="n" id="tgacc-sum-ok">0</span><span style="color:var(--green)">✅ সফল</span></div>
+              <div><span class="n" id="tgacc-sum-skip">0</span><span style="color:var(--muted)">⏭ আগে থেকেই আছে</span></div>
+              <div><span class="n" id="tgacc-sum-fail">0</span><span style="color:var(--red)">❌ ব্যর্থ</span></div>
+              <div><span class="n" id="tgacc-sum-total">0</span><span>মোট</span></div>
+            </div>
+
+            <div style="display:flex;gap:8px;margin-top:14px">
+              <button class="btn btn-green" id="tgacc-start-btn" onclick="tgAccStartAdding()">🚀 সিলেক্ট করা Group-এ Bot Add করুন</button>
+              <button class="btn btn-danger" id="tgacc-stop-btn" onclick="tgAccStopAdding()" style="display:none">⏹ থামান</button>
             </div>
           </div>
         </div>
@@ -1446,7 +1456,7 @@ async function enterDashboard() {
 
 function goSetup() {
   stopAutoRefresh();
-  stopChatPolling();
+  tgAccStopFlag = true;
   document.getElementById('dashboard').style.display = 'none';
   document.getElementById('setup-screen').style.display = 'flex';
   renderSetupTokens();
@@ -2368,283 +2378,470 @@ function formatFileSize(bytes) {
 }
 
 // ═══════════════════════════════════════════
-//  CHAT PAGE
+//  TELEGRAM ACCOUNT LOGIN (MTProto — real personal account)
+//  Lets the user log into their OWN Telegram account from the browser,
+//  see every group/supergroup/channel that account is a member of, and
+//  bulk-invite the configured Bot into all of them — skipping any group
+//  that was already successfully added before.
 // ═══════════════════════════════════════════
-let chatState = {
-  activeGroupId: null,
-  polling: false,
-  offset: 0,
-  pollTimer: null,
-  messages: {},      // { groupId: [ msgObj, ... ] }
-  unread: {},        // { groupId: count }
-  replyToMsgId: null,
-  replyToText: null,
-  knownMsgIds: {},   // { groupId: Set<msg_id> }
-};
+let tgAcc = { apiId: '', apiHash: '', phone: '', phoneCodeHash: '', loggedIn: false, user: null };
+let tgAccDialogs = [];          // [{id, accessHash, title, kind:'chat'|'megagroup'|'channel', membersCount}]
+let tgAccSelected = new Set();  // dialog ids selected for the current bulk-add run
+let addedGroupsLog = {};        // { [botTokenHash]: { [dialogId]: true } } — only TRUE successes are recorded
+let tgAccAddRunning = false;
+let tgAccStopFlag = false;
+let tgAccResumeAttempted = false;
 
-function initChatPage() {
-  renderChatGroupList();
-}
-
-function renderChatGroupList() {
-  const el = document.getElementById('chat-group-items');
-  if (!el) return;
-  if (allGroups.length === 0) {
-    el.innerHTML = `<div style="padding:20px;text-align:center;color:var(--muted);font-size:13px">Groups লোড করুন প্রথমে</div>`;
-    return;
-  }
-  el.innerHTML = '';
-  allGroups.forEach(g => {
-    const unread = chatState.unread[g.id] || 0;
-    const msgs = chatState.messages[g.id] || [];
-    const lastMsg = msgs[msgs.length - 1];
-    const lastText = lastMsg ? (lastMsg._sender + ': ' + (lastMsg.text || '[media]')).slice(0, 38) : typeLabel(g.type);
-    const div = document.createElement('div');
-    div.className = 'chat-group-item' + (chatState.activeGroupId === g.id ? ' active' : '');
-    div.dataset.gid = g.id;
-    div.innerHTML = `
-      <div class="cg-avatar">${getInitials(g.name)}</div>
-      <div class="cg-info">
-        <div class="cg-name">${escHtml(g.name)}</div>
-        <div class="cg-last">${escHtml(lastText)}</div>
-      </div>
-      ${unread > 0 ? `<div class="cg-badge">${unread > 9 ? '9+' : unread}</div>` : ''}
-    `;
-    div.onclick = () => openChatGroup(g.id);
-    el.appendChild(div);
-  });
-}
-
-function openChatGroup(groupId) {
-  chatState.activeGroupId = groupId;
-  chatState.unread[groupId] = 0;
-  const g = allGroups.find(x => x.id === groupId);
-  if (!g) return;
-
-  // Update group list highlight
-  document.querySelectorAll('.chat-group-item').forEach(el => {
-    el.classList.toggle('active', parseInt(el.dataset.gid) === groupId);
-  });
-
-  // Show panel
-  document.getElementById('chat-no-group').style.display = 'none';
-  const panel = document.getElementById('chat-active-panel');
-  panel.style.display = 'flex';
-
-  document.getElementById('chat-active-avatar').textContent = getInitials(g.name);
-  document.getElementById('chat-active-name').textContent = g.name;
-  document.getElementById('chat-active-meta').textContent = typeLabel(g.type) + (g.username ? ' · @' + g.username : '') + ' · ID: ' + g.id;
-
-  // Enable send button
-  document.getElementById('chat-send-btn').disabled = false;
-
-  clearReply();
-  renderChatMessages(groupId);
-  renderChatGroupList();
-}
-
-function renderChatMessages(groupId) {
-  const area = document.getElementById('chat-messages-area');
-  if (!area) return;
-  const msgs = chatState.messages[groupId] || [];
-
-  if (msgs.length === 0) {
-    area.innerHTML = `<div style="flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:8px;color:var(--muted);padding:40px">
-      <div style="font-size:36px">💬</div>
-      <div style="font-size:13px">${chatState.polling ? 'Message আসার অপেক্ষায় আছি...' : 'Polling চালু করুন নতুন message দেখতে'}</div>
-    </div>`;
-    return;
-  }
-
-  area.innerHTML = msgs.map(m => {
-    const isOut = m._isBot;
-    const replyHtml = m.replyText
-      ? `<div class="msg-reply-orig">↩ ${escHtml(m.replyText.slice(0, 80))}</div>`
-      : '';
-    const mediaHtml = m.photo ? `<div style="font-size:11px;color:var(--muted);margin-bottom:4px">📷 Photo${m.text ? '' : ' (no caption)'}</div>` : '';
-    const sticker = m.sticker ? `<div style="font-size:24px">${m.sticker}</div>` : '';
-    return `
-      <div class="msg-bubble ${isOut ? 'outgoing' : 'incoming'}" id="msg-${m.id}">
-        ${!isOut ? `<div class="msg-sender">${escHtml(m._sender)}</div>` : ''}
-        <div class="msg-body" ondblclick="setReply(${m.id}, \`${escHtml((m.text||'').replace(/`/g,'').slice(0,100))}\`)">
-          ${replyHtml}${mediaHtml}${sticker}${m.text ? escHtml(m.text) : ''}
-        </div>
-        <div class="msg-time">${m._time}${isOut ? ' ✓' : ''}</div>
-      </div>`;
-  }).join('');
-
-  // Scroll to bottom
-  area.scrollTop = area.scrollHeight;
-}
-
-function setReply(msgId, text) {
-  chatState.replyToMsgId = msgId;
-  chatState.replyToText = text;
-  const preview = document.getElementById('chat-reply-preview');
-  document.getElementById('chat-reply-text').textContent = text || '(media)';
-  preview.classList.add('active');
-  document.getElementById('chat-input-text').focus();
-}
-
-function clearReply() {
-  chatState.replyToMsgId = null;
-  chatState.replyToText = null;
-  const preview = document.getElementById('chat-reply-preview');
-  if (preview) preview.classList.remove('active');
-}
-
-function chatInputKeydown(e) {
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault();
-    sendChatReply();
-  }
-}
-
-async function sendChatReply() {
-  const gid = chatState.activeGroupId;
-  if (!gid) return;
-  const input = document.getElementById('chat-input-text');
-  const text = input.value.trim();
-  if (!text) return;
-
-  const btn = document.getElementById('chat-send-btn');
-  btn.disabled = true;
-  input.value = '';
-
+function loadTgAcc() {
   try {
-    const params = { chat_id: gid, text };
-    if (chatState.replyToMsgId) params.reply_to_message_id = chatState.replyToMsgId;
-    const result = await tgRequest('sendMessage', params);
+    const s = localStorage.getItem('tgm_tgacc');
+    if (s) tgAcc = { ...tgAcc, ...JSON.parse(s) };
+  } catch(e) {}
+  try {
+    const d = localStorage.getItem('tgm_tgacc_dialogs');
+    if (d) { tgAccDialogs = JSON.parse(d); tgAccSelected = new Set(tgAccDialogs.map(x => x.id)); }
+  } catch(e) {}
+  try {
+    const a = localStorage.getItem('tgm_tgacc_added');
+    if (a) addedGroupsLog = JSON.parse(a);
+  } catch(e) {}
+}
 
-    // Add to local messages
-    const bot = bots[activeBotIdx];
-    pushMessage(gid, {
-      id: result.message_id,
-      text,
-      _sender: bot?.firstname || bot?.name || 'Bot',
-      _isBot: true,
-      _time: new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
-      replyText: chatState.replyToText,
-    });
-    clearReply();
-    renderChatMessages(gid);
-    renderChatGroupList();
+// NOTE: only non-sensitive account info (name/phone/api keys you typed
+// yourself) is stored here. The actual MTProto session/auth-key is kept by
+// the @mtproto/core library in ITS OWN localStorage entries — this app never
+// reads, copies, or sends that to Firebase.
+function saveTgAcc() {
+  try {
+    localStorage.setItem('tgm_tgacc', JSON.stringify({
+      apiId: tgAcc.apiId, apiHash: tgAcc.apiHash, phone: tgAcc.phone,
+      loggedIn: tgAcc.loggedIn, user: tgAcc.user
+    }));
+  } catch(e) {}
+}
+
+function saveTgAccDialogs() {
+  try { localStorage.setItem('tgm_tgacc_dialogs', JSON.stringify(tgAccDialogs)); } catch(e) {}
+}
+
+function saveAddedGroupsLog() {
+  try { localStorage.setItem('tgm_tgacc_added', JSON.stringify(addedGroupsLog)); } catch(e) {}
+  if (fbConnected) window.fbSet('tgacc_added', addedGroupsLog).catch(()=>{});
+}
+
+async function loadAddedGroupsLogFromFb() {
+  if (!fbConnected) return;
+  try {
+    const data = await window.fbGet('tgacc_added');
+    if (data) addedGroupsLog = data;
+  } catch(e) {}
+}
+
+function tgAccSetStatus(html) {
+  const el = document.getElementById('tgacc-status');
+  if (el) el.innerHTML = html;
+}
+
+// ── UI rendering ──
+function renderTgAccUI() {
+  if (tgAcc.loggedIn && !tgAccResumeAttempted) tgAccTryResume();
+
+  const loginPanel = document.getElementById('tgacc-login-panel');
+  const mainPanel = document.getElementById('tgacc-main-panel');
+  if (!loginPanel || !mainPanel) return;
+
+  if (tgAcc.loggedIn) {
+    loginPanel.style.display = 'none';
+    mainPanel.style.display = 'block';
+    document.getElementById('tgacc-avatar').textContent = getInitials(tgAcc.user?.firstName || '?');
+    document.getElementById('tgacc-name').textContent =
+      [tgAcc.user?.firstName, tgAcc.user?.lastName].filter(Boolean).join(' ') || 'Telegram User';
+    document.getElementById('tgacc-phone-show').textContent = tgAcc.phone ? '+' + tgAcc.phone.replace(/^\+/, '') : '';
+    renderTgAccBotSelect();
+    renderTgAccDialogList();
+  } else {
+    loginPanel.style.display = 'block';
+    mainPanel.style.display = 'none';
+  }
+}
+
+// Try to silently resume a previous session using the cached api_id/hash —
+// if the saved auth key is no longer valid, fall back to the login form.
+async function tgAccTryResume() {
+  if (tgAccResumeAttempted) return;
+  tgAccResumeAttempted = true;
+  if (!tgAcc.loggedIn || !tgAcc.apiId || !tgAcc.apiHash) return;
+  try {
+    await window.tgmConnect(tgAcc.apiId, tgAcc.apiHash);
+    await window.tgmCall('users.getFullUser', { id: { _: 'inputUserSelf' } });
+    await loadAddedGroupsLogFromFb();
+    renderTgAccDialogList();
   } catch(e) {
-    toast('পাঠানো যায়নি: ' + e.message, 'err');
+    tgAcc.loggedIn = false;
+    saveTgAcc();
+    renderTgAccUI();
+  }
+}
+
+function renderTgAccBotSelect() {
+  const sel = document.getElementById('tgacc-bot-select');
+  if (!sel) return;
+  sel.innerHTML = bots.length
+    ? bots.map((b, i) => `<option value="${i}">${escHtml(b.name)}${b.username ? ' (@' + escHtml(b.username) + ')' : ''}</option>`).join('')
+    : '<option value="">কোনো Bot যোগ করা নেই — Settings থেকে যোগ করুন</option>';
+}
+
+function renderTgAccDialogList() {
+  const el = document.getElementById('tgacc-dialog-list');
+  if (!el) return;
+  const countEl = document.getElementById('tgacc-dialog-count');
+  if (countEl) countEl.textContent = tgAccDialogs.length;
+
+  if (tgAccDialogs.length === 0) {
+    el.innerHTML = `<div class="empty-state" style="padding:30px 10px"><p>"⟳ Group তালিকা রিফ্রেশ" বাটনে চাপুন।</p></div>`;
+    return;
+  }
+
+  const botIdx = Number(document.getElementById('tgacc-bot-select')?.value || 0);
+  const botToken = bots[botIdx]?.token;
+  const botHash = botToken ? tokenHash(botToken) : null;
+
+  el.innerHTML = tgAccDialogs.map(d => {
+    const already = botHash && addedGroupsLog[botHash]?.[d.id];
+    const checked = tgAccSelected.has(d.id) ? 'checked' : '';
+    const kindLabel = d.kind === 'megagroup' ? 'Supergroup' : d.kind === 'channel' ? 'Channel' : 'Group';
+    const statusHtml = already
+      ? '<span class="status-badge badge-ok">✅ আগে যুক্ত</span>'
+      : '<span class="status-badge" id="tgacc-status-wrap-' + d.id + '-inner" style="background:var(--surface2);color:var(--muted)">⏳ পেন্ডিং</span>';
+    return `
+      <label class="tgacc-dialog-item">
+        <input type="checkbox" ${checked} onchange="tgAccToggleSelect(${d.id}, this.checked)">
+        <div class="group-avatar">${getInitials(d.title)}</div>
+        <div class="tgacc-dialog-info">
+          <div class="tgacc-dialog-name">${escHtml(d.title)}</div>
+          <div class="tgacc-dialog-meta">${kindLabel}${d.membersCount ? ' · ' + d.membersCount + ' সদস্য' : ''}</div>
+        </div>
+        <div class="tgacc-dialog-status" id="tgacc-status-wrap-${d.id}">${statusHtml}</div>
+      </label>`;
+  }).join('');
+}
+
+function tgAccToggleSelect(id, checked) {
+  if (checked) tgAccSelected.add(id); else tgAccSelected.delete(id);
+}
+
+function tgAccToggleSelectAll() {
+  if (tgAccSelected.size === tgAccDialogs.length) tgAccSelected.clear();
+  else tgAccDialogs.forEach(d => tgAccSelected.add(d.id));
+  renderTgAccDialogList();
+}
+
+// ── Login flow ──
+async function tgAccSendCode() {
+  const apiId = document.getElementById('tgacc-api-id').value.trim();
+  const apiHash = document.getElementById('tgacc-api-hash').value.trim();
+  const phone = document.getElementById('tgacc-phone').value.trim().replace(/[^\d+]/g, '');
+
+  if (!apiId || !/^\d+$/.test(apiId)) { tgAccSetStatus('<span style="color:var(--red)">❌ সঠিক API ID দিন</span>'); return; }
+  if (!apiHash || apiHash.length < 10) { tgAccSetStatus('<span style="color:var(--red)">❌ সঠিক API Hash দিন</span>'); return; }
+  if (!phone || !phone.replace('+', '').match(/^\d{6,15}$/)) {
+    tgAccSetStatus('<span style="color:var(--red)">❌ Country code সহ সঠিক Phone Number দিন (যেমন +8801...)</span>'); return;
+  }
+
+  const btn = document.getElementById('tgacc-send-code-btn');
+  btn.disabled = true;
+  tgAccSetStatus('⏳ সংযোগ করা হচ্ছে...');
+  try {
+    await window.tgmConnect(apiId, apiHash);
+    const result = await window.tgmCall('auth.sendCode', {
+      phone_number: phone,
+      settings: { _: 'codeSettings' }
+    });
+    tgAcc.apiId = apiId; tgAcc.apiHash = apiHash; tgAcc.phone = phone;
+    tgAcc.phoneCodeHash = result.phone_code_hash;
+    saveTgAcc();
+    document.getElementById('tgacc-step-creds').style.display = 'none';
+    document.getElementById('tgacc-step-code').style.display = 'block';
+    tgAccSetStatus('<span style="color:var(--green)">✅ কোড পাঠানো হয়েছে — Telegram app/SMS চেক করুন</span>');
+    addLog('ok', 'Telegram account login কোড পাঠানো হয়েছে: ' + phone);
+  } catch(e) {
+    tgAccSetStatus('<span style="color:var(--red)">❌ ব্যর্থ: ' + escHtml(e.error_message || e.message || 'অজানা সমস্যা') + '</span>');
+    addLog('err', 'Telegram login (sendCode) ব্যর্থ: ' + (e.error_message || e.message));
   }
   btn.disabled = false;
-  input.focus();
 }
 
-function pushMessage(groupId, msg) {
-  if (!chatState.messages[groupId]) chatState.messages[groupId] = [];
-  if (!chatState.knownMsgIds[groupId]) chatState.knownMsgIds[groupId] = new Set();
-  if (chatState.knownMsgIds[groupId].has(msg.id)) return false; // duplicate
-  chatState.knownMsgIds[groupId].add(msg.id);
-  chatState.messages[groupId].push(msg);
-  // Keep last 200 msgs per group
-  if (chatState.messages[groupId].length > 200) chatState.messages[groupId].shift();
-  return true;
+function tgAccBackToCreds() {
+  document.getElementById('tgacc-step-code').style.display = 'none';
+  document.getElementById('tgacc-step-creds').style.display = 'block';
+  tgAccSetStatus('');
 }
 
-function toggleChatPolling() {
-  if (chatState.polling) stopChatPolling();
-  else startChatPolling();
-}
-
-async function startChatPolling() {
-  if (chatState.polling) return;
-  if (bots.length === 0) { toast('আগে Bot token যোগ করুন', 'err'); return; }
-
-  // Get latest offset so we only see new messages
+async function tgAccVerifyCode() {
+  const code = document.getElementById('tgacc-code').value.trim();
+  if (!code) { tgAccSetStatus('<span style="color:var(--red)">❌ কোড লিখুন</span>'); return; }
+  tgAccSetStatus('⏳ যাচাই করা হচ্ছে...');
   try {
-    const latest = await tgRequest('getUpdates', { limit: 1, offset: -1 });
-    chatState.offset = latest.length ? latest[latest.length - 1].update_id + 1 : 0;
-  } catch(e) {}
-
-  chatState.polling = true;
-  updateChatPollUI();
-  addLog('ok', '[Chat] Live polling চালু হয়েছে');
-  chatPollLoop();
-}
-
-function stopChatPolling() {
-  chatState.polling = false;
-  updateChatPollUI();
-  addLog('info', '[Chat] Live polling বন্ধ হয়েছে');
-}
-
-function updateChatPollUI() {
-  const btn = document.getElementById('chat-poll-btn');
-  const badge = document.getElementById('chat-poll-badge');
-  const liveEl = document.getElementById('chat-live-indicator');
-  if (chatState.polling) {
-    if (btn) { btn.textContent = '⏹ বন্ধ'; btn.className = 'btn btn-danger'; btn.style.cssText = 'font-size:11px;padding:4px 10px'; }
-    if (badge) { badge.textContent = ''; badge.innerHTML = '<span style="width:7px;height:7px;border-radius:50%;background:var(--green);display:inline-block;animation:pulse-anim 1s ease infinite;margin-right:4px"></span><span style="color:var(--green);font-weight:600">Live</span>'; }
-    if (liveEl) liveEl.style.display = 'flex';
-  } else {
-    if (btn) { btn.textContent = '▶ চালু'; btn.className = 'btn btn-green'; btn.style.cssText = 'font-size:11px;padding:4px 10px'; }
-    if (badge) badge.textContent = 'Polling বন্ধ';
-    if (liveEl) liveEl.style.display = 'none';
-  }
-}
-
-async function chatPollLoop() {
-  while (chatState.polling) {
-    try {
-      const updates = await tgRequest('getUpdates', {
-        offset: chatState.offset,
-        timeout: 20,
-        allowed_updates: ['message']
-      });
-
-      for (const u of updates) {
-        chatState.offset = u.update_id + 1;
-        const msg = u.message;
-        if (!msg || !msg.chat) continue;
-        if (!['group','supergroup'].includes(msg.chat.type)) continue;
-
-        const gid = msg.chat.id;
-        // Register group if new
-        registerGroupFromChat(msg.chat);
-
-        const senderName = msg.from
-          ? ([msg.from.first_name, msg.from.last_name].filter(Boolean).join(' ') || msg.from.username || String(msg.from.id))
-          : 'Unknown';
-        const isBot = msg.from?.is_bot || false;
-
-        let replyText = null;
-        if (msg.reply_to_message?.text) replyText = msg.reply_to_message.text;
-
-        const newMsg = {
-          id: msg.message_id,
-          text: msg.text || msg.caption || '',
-          photo: !!(msg.photo || msg.document),
-          sticker: msg.sticker ? (msg.sticker.emoji || '🎭') : null,
-          _sender: senderName,
-          _isBot: isBot,
-          _time: new Date(msg.date * 1000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
-          replyText,
-        };
-
-        const isNew = pushMessage(gid, newMsg);
-        if (isNew && !isBot) {
-          // increment unread if not currently viewing this group
-          if (chatState.activeGroupId !== gid) {
-            chatState.unread[gid] = (chatState.unread[gid] || 0) + 1;
-          }
-        }
-
-        // Re-render if active group
-        if (chatState.activeGroupId === gid) {
-          renderChatMessages(gid);
-        }
-        renderChatGroupList();
-      }
-    } catch(e) {
-      if (chatState.polling) await delay(3000);
+    const result = await window.tgmCall('auth.signIn', {
+      phone_number: tgAcc.phone,
+      phone_code_hash: tgAcc.phoneCodeHash,
+      phone_code: code
+    });
+    await tgAccFinishLogin(result.user);
+  } catch(e) {
+    if ((e.error_message || '') === 'SESSION_PASSWORD_NEEDED') {
+      document.getElementById('tgacc-step-code').style.display = 'none';
+      document.getElementById('tgacc-step-password').style.display = 'block';
+      tgAccSetStatus('<span style="color:var(--yellow)">🔒 2FA Password প্রয়োজন</span>');
+    } else {
+      tgAccSetStatus('<span style="color:var(--red)">❌ ব্যর্থ: ' + escHtml(e.error_message || e.message || 'অজানা সমস্যা') + '</span>');
+      addLog('err', 'Telegram login (signIn) ব্যর্থ: ' + (e.error_message || e.message));
     }
   }
+}
+
+async function tgAccCheckPassword() {
+  const password = document.getElementById('tgacc-password').value;
+  if (!password) { tgAccSetStatus('<span style="color:var(--red)">❌ Password দিন</span>'); return; }
+  tgAccSetStatus('⏳ যাচাই করা হচ্ছে...');
+  try {
+    const pwInfo = await window.tgmCall('account.getPassword');
+    const { A, M1 } = await window.tgmGetSRPParams({
+      g: pwInfo.current_algo.g,
+      p: pwInfo.current_algo.p,
+      salt1: pwInfo.current_algo.salt1,
+      salt2: pwInfo.current_algo.salt2,
+      gB: pwInfo.srp_B,
+      password
+    });
+    const result = await window.tgmCall('auth.checkPassword', {
+      password: { _: 'inputCheckPasswordSRP', srp_id: pwInfo.srp_id, A, M1 }
+    });
+    await tgAccFinishLogin(result.user);
+  } catch(e) {
+    tgAccSetStatus('<span style="color:var(--red)">❌ ব্যর্থ: ' + escHtml(e.error_message || e.message || 'অজানা সমস্যা') + '</span>');
+    addLog('err', 'Telegram login (2FA) ব্যর্থ: ' + (e.error_message || e.message));
+  }
+}
+
+async function tgAccFinishLogin(user) {
+  tgAcc.loggedIn = true;
+  tgAcc.user = { id: user.id, firstName: user.first_name, lastName: user.last_name, username: user.username };
+  tgAccResumeAttempted = true; // we just logged in fresh — no need to "resume"
+  saveTgAcc();
+  await loadAddedGroupsLogFromFb();
+
+  // clear sensitive inputs from the DOM
+  const codeEl = document.getElementById('tgacc-code'); if (codeEl) codeEl.value = '';
+  const pwEl = document.getElementById('tgacc-password'); if (pwEl) pwEl.value = '';
+
+  tgAccSetStatus('<span style="color:var(--green)">✅ লগইন সফল!</span>');
+  toast('Telegram account-এ লগইন সফল হয়েছে! 📱', 'ok');
+  addLog('ok', 'Telegram account লগইন সফল: ' + (user.first_name || user.id));
+  renderTgAccUI();
+  await tgAccLoadDialogs();
+}
+
+async function tgAccLogout() {
+  try { await window.tgmCall('auth.logOut'); } catch(e) {}
+  window.tgmReset();
+  tgAcc = { apiId: '', apiHash: '', phone: '', phoneCodeHash: '', loggedIn: false, user: null };
+  tgAccDialogs = [];
+  tgAccSelected.clear();
+  tgAccResumeAttempted = false;
+  try {
+    localStorage.removeItem('tgm_tgacc');
+    localStorage.removeItem('tgm_tgacc_dialogs');
+  } catch(e) {}
+  document.getElementById('tgacc-step-creds').style.display = 'block';
+  document.getElementById('tgacc-step-code').style.display = 'none';
+  document.getElementById('tgacc-step-password').style.display = 'none';
+  document.getElementById('tgacc-api-id').value = '';
+  document.getElementById('tgacc-api-hash').value = '';
+  document.getElementById('tgacc-phone').value = '';
+  renderTgAccUI();
+  toast('Telegram account থেকে লগআউট হয়েছে', 'info');
+  addLog('info', 'Telegram account লগআউট');
+}
+
+// ── Dialog (group/channel) discovery ──
+function tgAccInputPeerFromDialog(peer, chats, users) {
+  if (peer._ === 'peerUser') {
+    const u = users.find(x => x.id === peer.user_id);
+    return { _: 'inputPeerUser', user_id: peer.user_id, access_hash: u?.access_hash || 0 };
+  }
+  if (peer._ === 'peerChat') {
+    return { _: 'inputPeerChat', chat_id: peer.chat_id };
+  }
+  if (peer._ === 'peerChannel') {
+    const c = chats.find(x => x.id === peer.channel_id);
+    return { _: 'inputPeerChannel', channel_id: peer.channel_id, access_hash: c?.access_hash || 0 };
+  }
+  return { _: 'inputPeerEmpty' };
+}
+
+async function tgAccLoadDialogs() {
+  if (!tgAcc.loggedIn) return;
+  const listEl = document.getElementById('tgacc-dialog-list');
+  listEl.innerHTML = `<div class="empty-state" style="padding:30px 10px">🔄 Group তালিকা লোড হচ্ছে...</div>`;
+
+  let offsetDate = 0, offsetId = 0, offsetPeer = { _: 'inputPeerEmpty' };
+  const collected = new Map();
+  try {
+    for (let page = 0; page < 25; page++) {
+      const result = await window.tgmCall('messages.getDialogs', {
+        offset_date: offsetDate, offset_id: offsetId, offset_peer: offsetPeer,
+        limit: 100, hash: 0
+      });
+      const dialogs = result.dialogs || [];
+      const chats = result.chats || [];
+      const users = result.users || [];
+
+      chats.forEach(c => {
+        if (c._ === 'chat' && !c.left && !c.deactivated) {
+          collected.set(c.id, { id: c.id, accessHash: null, title: c.title, kind: 'chat', membersCount: c.participants_count || null });
+        } else if (c._ === 'channel' && !c.left) {
+          collected.set(c.id, { id: c.id, accessHash: c.access_hash, title: c.title, kind: c.megagroup ? 'megagroup' : 'channel', membersCount: c.participants_count || null });
+        }
+      });
+
+      if (dialogs.length < 100) break; // reached the last page
+      const last = dialogs[dialogs.length - 1];
+      const lastMsg = (result.messages || []).find(m => m.id === last.top_message);
+      offsetId = lastMsg ? lastMsg.id : 0;
+      offsetDate = lastMsg ? lastMsg.date : 0;
+      offsetPeer = tgAccInputPeerFromDialog(last.peer, chats, users);
+      if (!offsetId) break;
+    }
+
+    tgAccDialogs = Array.from(collected.values());
+    tgAccSelected = new Set(tgAccDialogs.map(d => d.id));
+    saveTgAccDialogs();
+    renderTgAccDialogList();
+    addLog('ok', `Telegram account থেকে ${tgAccDialogs.length} টি group/channel পাওয়া গেছে`);
+    toast(`${tgAccDialogs.length} টি group/channel পাওয়া গেছে`, 'ok');
+  } catch(e) {
+    listEl.innerHTML = `<div class="empty-state" style="padding:30px 10px;color:var(--red)">❌ ব্যর্থ: ${escHtml(e.error_message || e.message || 'অজানা সমস্যা')}</div>`;
+    addLog('err', 'Group তালিকা লোড ব্যর্থ: ' + (e.error_message || e.message));
+  }
+}
+
+// ── Bulk add bot to groups ──
+async function tgAccResolveBotInputUser(botUsername) {
+  const result = await window.tgmCall('contacts.resolveUsername', { username: botUsername });
+  const u = (result.users || [])[0];
+  if (!u) throw new Error('Bot username খুঁজে পাওয়া যায়নি — username ঠিক আছে কিনা দেখুন');
+  return { _: 'inputUser', user_id: u.id, access_hash: u.access_hash };
+}
+
+function tgAccUpdateDialogStatusUI(id, html) {
+  const el = document.getElementById('tgacc-status-wrap-' + id);
+  if (el) el.innerHTML = html;
+}
+
+function tgAccUpdateSummary(ok, skip, fail, total) {
+  const bar = document.getElementById('tgacc-summary-bar');
+  if (bar) bar.style.display = 'flex';
+  document.getElementById('tgacc-sum-ok').textContent = ok;
+  document.getElementById('tgacc-sum-skip').textContent = skip;
+  document.getElementById('tgacc-sum-fail').textContent = fail;
+  document.getElementById('tgacc-sum-total').textContent = total;
+}
+
+async function tgAccStartAdding() {
+  if (tgAccAddRunning) return;
+  const botIdx = Number(document.getElementById('tgacc-bot-select').value || 0);
+  const bot = bots[botIdx];
+  if (!bot) { toast('আগে Settings থেকে একটি Bot token যোগ করুন', 'err'); return; }
+
+  if (!bot.username) {
+    try { const me = await getMe(bot.token); bot.username = me.username; }
+    catch(e) { toast('Bot token যাচাই করা যায়নি', 'err'); return; }
+  }
+
+  const targets = tgAccDialogs.filter(d => tgAccSelected.has(d.id));
+  if (targets.length === 0) { toast('কোনো group সিলেক্ট করা নেই', 'err'); return; }
+
+  const botHash = tokenHash(bot.token);
+  if (!addedGroupsLog[botHash]) addedGroupsLog[botHash] = {};
+
+  tgAccAddRunning = true;
+  tgAccStopFlag = false;
+  document.getElementById('tgacc-start-btn').style.display = 'none';
+  document.getElementById('tgacc-stop-btn').style.display = '';
+
+  let inputUser;
+  try {
+    inputUser = await tgAccResolveBotInputUser(bot.username);
+  } catch(e) {
+    toast('Bot resolve ব্যর্থ: ' + (e.error_message || e.message), 'err');
+    tgAccAddRunning = false;
+    document.getElementById('tgacc-start-btn').style.display = '';
+    document.getElementById('tgacc-stop-btn').style.display = 'none';
+    return;
+  }
+
+  let ok = 0, skip = 0, fail = 0;
+  addLog('info', `[Account Add] "@${bot.username}" কে ${targets.length} টি group-এ যুক্ত করা শুরু হলো...`);
+
+  for (const d of targets) {
+    if (tgAccStopFlag) { addLog('info', '[Account Add] ব্যবহারকারী থামিয়ে দিয়েছেন'); break; }
+
+    // Already added before for this bot — never retry it.
+    if (addedGroupsLog[botHash][d.id]) {
+      skip++;
+      tgAccUpdateDialogStatusUI(d.id, '<span class="status-badge badge-skip">⏭ আগেই আছে</span>');
+      tgAccUpdateSummary(ok, skip, fail, targets.length);
+      continue;
+    }
+
+    tgAccUpdateDialogStatusUI(d.id, '<span class="status-badge badge-loading">⏳ যুক্ত করা হচ্ছে...</span>');
+
+    try {
+      if (d.kind === 'chat') {
+        await window.tgmCall('messages.addChatUser', { chat_id: d.id, user_id: inputUser, fwd_limit: 50 });
+      } else {
+        const inputChannel = { _: 'inputChannel', channel_id: d.id, access_hash: d.accessHash };
+        await window.tgmCall('channels.inviteToChannel', { channel: inputChannel, users: [inputUser] });
+      }
+      ok++;
+      addedGroupsLog[botHash][d.id] = true;
+      saveAddedGroupsLog();
+      tgAccUpdateDialogStatusUI(d.id, '<span class="status-badge badge-ok">✅ যুক্ত হয়েছে</span>');
+      addLog('ok', `[Account Add] "${d.title}" — bot যুক্ত হয়েছে`);
+    } catch(e) {
+      const code = e.error_code;
+      const msg = e.error_message || e.message || 'অজানা সমস্যা';
+      if (msg === 'USER_ALREADY_PARTICIPANT') {
+        ok++;
+        addedGroupsLog[botHash][d.id] = true;
+        saveAddedGroupsLog();
+        tgAccUpdateDialogStatusUI(d.id, '<span class="status-badge badge-ok">✅ আগেই Member</span>');
+      } else if (code === 420 || msg === 'PEER_FLOOD') {
+        fail++;
+        tgAccUpdateDialogStatusUI(d.id, '<span class="status-badge badge-err">❌ Flood limit</span>');
+        addLog('err', `[Account Add] Telegram rate-limit/spam সুরক্ষায় পুরো ব্যাচ থামিয়ে দেওয়া হলো: ${msg}`);
+        toast('Telegram rate-limit ধরেছে — কিছুক্ষণ/কিছু সময় পর আবার চেষ্টা করুন', 'err');
+        break; // continuing would very likely keep failing for every remaining group
+      } else {
+        fail++;
+        tgAccUpdateDialogStatusUI(d.id, `<span class="status-badge badge-err" title="${escHtml(msg)}">❌ ব্যর্থ</span>`);
+        addLog('err', `[Account Add] "${d.title}" ব্যর্থ: ${msg}`);
+      }
+    }
+    tgAccUpdateSummary(ok, skip, fail, targets.length);
+    await delay(1500); // gentle pacing — helps avoid tripping Telegram's anti-spam limits
+  }
+
+  tgAccAddRunning = false;
+  document.getElementById('tgacc-start-btn').style.display = '';
+  document.getElementById('tgacc-stop-btn').style.display = 'none';
+  toast(`শেষ — ✅ ${ok} | ⏭ ${skip} | ❌ ${fail}`, fail > 0 ? 'info' : 'ok');
+  addLog('info', `[Account Add] সম্পন্ন — সফল: ${ok}, আগে থেকে ছিল: ${skip}, ব্যর্থ: ${fail}`);
+}
+
+function tgAccStopAdding() {
+  tgAccStopFlag = true;
 }
 
 function addLog(type, msg) {
@@ -2856,6 +3053,7 @@ loadFbConfigToUI();
 loadEnvTokens();
 loadGeminiSettings();
 loadAIGroups();
+loadTgAcc();
 renderSetupTokens();
 renderFullLog();
 renderAISettingsUI();
